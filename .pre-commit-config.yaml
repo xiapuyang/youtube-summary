@@ -1,0 +1,37 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: no-commit-to-branch
+        args: [--branch, main]
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: check-yaml
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: no-wip-commit
+        name: Block WIP commits
+        language: pygrep
+        entry: '^(wip|WIP)\b'
+        stages: [commit-msg]
+
+      - id: commit-msg-length
+        name: Subject line ≤ 72 chars
+        language: system
+        entry: >-
+          bash -c
+          'line=$(head -1 "$1");
+          len=${#line};
+          if [ -z "${line// }" ]; then echo "❌ Empty commit message"; exit 1; fi;
+          if [ "$len" -gt 72 ]; then echo "❌ Subject too long ($len chars, max 72)"; exit 1; fi' --
+        stages: [commit-msg]

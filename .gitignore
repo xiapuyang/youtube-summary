@@ -1,0 +1,26 @@
+# macOS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python cache (SKILL.md runs inline python3 heredocs)
+__pycache__/
+*.py[cod]
+
+# Secrets / cookies — the skill writes a Bilibili cookies file locally
+*_cookies.txt
+.env
+*.env
+*.pem
+*.key
+
+# Logs / temp / backups
+*.log
+*.tmp
+*.bak
+*.orig
+
+# Claude Code local state
+.claude/
