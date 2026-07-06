@@ -280,6 +280,14 @@ NOW=$(date +"%Y-%m-%dT%H:%M")
 WORDS=$(wc -w < "$TMPDIR/timestamped.txt" | tr -d ' ')
 ```
 
+**YAML safety rule — escape before inserting into frontmatter:**
+Any string value interpolated into a double-quoted YAML field must have internal `"` escaped as `\"`. This applies to `title`, `description`, and chapter titles — all of which can contain quotes from the original video metadata. Use this Python helper when building frontmatter values:
+
+```python
+def yq(v): return str(v).replace('\\', '\\\\').replace('"', '\\"')
+# Usage: f'description: "{yq(description)}"'
+```
+
 ```markdown
 ---
 title: "<title>"
@@ -287,7 +295,7 @@ source: "<URL>"
 author:
   - "[[<channel>]]"
 published: "<YYYYMMDD>"
-description: "<DESCRIPTION>"
+description: "<DESCRIPTION — with internal \" escaped>"
 tags:
   - "<PLATFORM>"
 ctime: "<NOW>"
