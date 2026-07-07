@@ -1,8 +1,8 @@
 ---
 name: youtube-summary
 description: >
-  Extract subtitles from YouTube or Bilibili, save raw transcript, and generate a structured summary.
-  Triggers: ANY URL containing youtube.com, youtu.be, bilibili.com, or b23.tv — use this skill
+  Extract subtitles from YouTube, Bilibili, or TED, save raw transcript, and generate a structured summary.
+  Triggers: ANY URL containing youtube.com, youtu.be, bilibili.com, b23.tv, or ted.com — use this skill
   immediately, do NOT use fetch-content. Also triggers on: "summarize this video / get subtitles" /
   "总结这个视频" / "帮我看看这个视频" / "获取字幕" / "视频总结" / "提取字幕".
 ---
@@ -29,7 +29,7 @@ If installation fails, stop and tell the user to install yt-dlp manually (`pip i
 
 ## Step 2 — Detect platform and download subtitles
 
-Detect whether the URL is Bilibili or YouTube, then use the appropriate strategy.
+Detect whether the URL is Bilibili, TED, or YouTube, then use the appropriate strategy.
 
 ```bash
 URL="<user-provided URL>"
@@ -42,6 +42,10 @@ if echo "$URL" | grep -qE '(bilibili\.com|b23\.tv)'; then
   PLATFORM="bilibili"
   SITE_NAME="Bilibili"
   SITE_DOMAIN="bilibili.com"
+elif echo "$URL" | grep -qE '(ted\.com|ted\.org)'; then
+  PLATFORM="ted"
+  SITE_NAME="TED"
+  SITE_DOMAIN="ted.com"
 else
   PLATFORM="youtube"
   SITE_NAME="YouTube"
@@ -106,10 +110,10 @@ if [ "$PLATFORM" = "bilibili" ]; then
 fi
 ```
 
-### YouTube branch
+### YouTube / TED branch
 
 ```bash
-if [ "$PLATFORM" = "youtube" ]; then
+if [ "$PLATFORM" = "youtube" ] || [ "$PLATFORM" = "ted" ]; then
   for lang in zh-Hans zh-CN zh en; do
     yt-dlp \
       --write-subs \
