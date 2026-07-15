@@ -35,6 +35,10 @@ references/
 
 读这些**反直觉**约定，否则容易改坏：
 
+- **小宇宙走完全不同的路**：xiaoyuzhou 没有字幕轨，跳过 yt-dlp，改为 curl 下 m4a → ffmpeg 转 wav → sherpa-onnx SenseVoice 转录，直接产出 `cleaned.txt`/`timestamped.txt`，Step 3 对 xiaoyuzhou 会被跳过（`SUB_FILE` 为空是预期行为，不是 bug）。
+- **sherpa-onnx 复用 Type4Me 模型**：模型路径硬编码为 `~/Library/Application Support/Type4Me/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/model.int8.onnx`，无需额外下载。只需 `pip install sherpa-onnx`（约 50MB）。Whisper 系列（openai-whisper / faster-whisper）是 fallback。
+- **元数据来自页面 JSON 而非 yt-dlp**：小宇宙的 title/duration/description 等从页面 `__NEXT_DATA__` 提取并写入 `$TMPDIR/xyz_meta.json`，Step 5 直接读这个文件。改元数据字段就改 Step 2 的 `xyz_meta.json` 构建逻辑。
+
 - **没有 .py 文件可改**：所有处理逻辑（字幕清洗、元数据解析、分块）都是 `SKILL.md` 里的内联 python heredoc。改行为 = 改 SKILL.md，别去找模块。
 - **Bilibili 必须带 cookies，YouTube 不带**：`$COOKIE_ARGS` 在 Step 2 设定（B 站为 `--cookies FILE`，YT 为空串），后续 Step 5 元数据复用同一变量。漏带 cookies → B 站 `--list-subs` 报登录错。
 - **字幕语言优先级是写死的回退链**：Bilibili `ai-zh → zh-Hans → zh-CN → zh → en`；YouTube `zh-Hans → zh-CN → zh → en`。命中第一条即停。

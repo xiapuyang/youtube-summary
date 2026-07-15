@@ -1,10 +1,10 @@
 ---
 name: youtube-summary
 description: >
-  Extract subtitles from YouTube, Bilibili, or TED, save raw transcript, and generate a structured summary.
-  Triggers: ANY URL containing youtube.com, youtu.be, bilibili.com, b23.tv, or ted.com — use this skill
+  Extract subtitles from YouTube, Bilibili, TED, or 小宇宙 (Xiaoyuzhou), save raw transcript, and generate a structured summary.
+  Triggers: ANY URL containing youtube.com, youtu.be, bilibili.com, b23.tv, ted.com, or xiaoyuzhoufm.com — use this skill
   immediately, do NOT use fetch-content. Also triggers on: "summarize this video / get subtitles" /
-  "总结这个视频" / "帮我看看这个视频" / "获取字幕" / "视频总结" / "提取字幕".
+  "总结这个视频" / "帮我看看这个视频" / "获取字幕" / "视频总结" / "提取字幕" / "总结播客" / "提取播客文字".
 ---
 
 # Video Subtitle Extractor (YouTube + Bilibili)
@@ -46,6 +46,10 @@ elif echo "$URL" | grep -qE '(ted\.com|ted\.org)'; then
   PLATFORM="ted"
   SITE_NAME="TED"
   SITE_DOMAIN="ted.com"
+elif echo "$URL" | grep -qE 'xiaoyuzhoufm\.com'; then
+  PLATFORM="xiaoyuzhou"
+  SITE_NAME="小宇宙"
+  SITE_DOMAIN="xiaoyuzhoufm.com"
 else
   PLATFORM="youtube"
   SITE_NAME="YouTube"
@@ -135,10 +139,170 @@ if [ "$PLATFORM" = "youtube" ] || [ "$PLATFORM" = "ted" ]; then
 fi
 ```
 
-### Fail if no subtitles
+### 小宇宙 (Xiaoyuzhou) branch
+
+No subtitle track. Download the public audio URL and transcribe with sherpa-onnx SenseVoice (reuses the model already on disk from Type4Me). Whisper is the fallback. This branch writes `cleaned.txt` and `timestamped.txt` directly, so Step 3 is skipped when it succeeds.
 
 ```bash
-if [ -z "$SUB_FILE" ]; then
+if [ "$PLATFORM" = "xiaoyuzhou" ]; then
+  COOKIE_ARGS=""
+
+  # Extract metadata + audio URL from page __NEXT_DATA__
+  python3 - "$URL" "$TMPDIR" <<'PYEOF'
+import sys, re, json
+from urllib.request import Request, urlopen
+
+url, tmpdir = sys.argv[1], sys.argv[2]
+req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+html = urlopen(req).read().decode('utf-8')
+
+m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.S)
+if not m:
+    print("ERROR: __NEXT_DATA__ not found", file=sys.stderr); sys.exit(1)
+
+ep = json.loads(m.group(1))['props']['pageProps']['episode']
+src = (ep.get('media') or {}).get('source') or {}
+audio_url = src.get('url') or (ep.get('enclosure') or {}).get('url', '')
+podcast = ep.get('podcast') or {}
+desc = re.sub(r'<[^>]+>', '', (ep.get('description') or ep.get('shownotes') or ''))
+first_para = desc.split('\n\n')[0].replace('\n', ' ')[:300]
+pub_date = (ep.get('pubDate') or '')[:10].replace('-', '')
+
+meta = {
+    'title': ep.get('title', ''),
+    'audio_url': audio_url,
+    'duration_secs': ep.get('duration', 0),
+    'pub_date': pub_date,
+    'description': first_para,
+    'podcast_name': podcast.get('title', ''),
+}
+json.dump(meta, open(f'{tmpdir}/xyz_meta.json', 'w'), ensure_ascii=False, indent=2)
+print(f"Title: {meta['title']}")
+print(f"Duration: {meta['duration_secs']//60} min")
+PYEOF
+
+  [ ! -f "$TMPDIR/xyz_meta.json" ] && { echo "Failed to parse xiaoyuzhou page."; rm -rf "$TMPDIR"; exit 1; }
+
+  XYZ_AUDIO_URL=$(python3 -c "import json; print(json.load(open('$TMPDIR/xyz_meta.json'))['audio_url'])")
+  XYZ_DURATION=$(python3 -c "import json; d=json.load(open('$TMPDIR/xyz_meta.json')); print(round(d['duration_secs']/60))")
+
+  # Download audio (public CDN, no auth required)
+  echo "Downloading audio (~${XYZ_DURATION} min)..."
+  curl -L --progress-bar -o "$TMPDIR/audio.m4a" "$XYZ_AUDIO_URL"
+  [ ! -s "$TMPDIR/audio.m4a" ] && { echo "Audio download failed."; rm -rf "$TMPDIR"; exit 1; }
+
+  # Convert to 16kHz mono WAV required by ASR models
+  ffmpeg -i "$TMPDIR/audio.m4a" -ar 16000 -ac 1 "$TMPDIR/audio.wav" -y -loglevel error
+
+  XYZ_TRANSCRIBED=false
+
+  # Primary: sherpa-onnx + Type4Me's local SenseVoice model (no extra download)
+  XYZ_MODEL_DIR="$HOME/Library/Application Support/Type4Me/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
+  if python3 -c "import sherpa_onnx" 2>/dev/null && [ -f "$XYZ_MODEL_DIR/model.int8.onnx" ]; then
+    echo "Transcribing with SenseVoice (sherpa-onnx)..."
+    XYZ_MODEL_DIR_ESC="$XYZ_MODEL_DIR" TMPDIR_ESC="$TMPDIR" python3 <<'PYEOF'
+import os, wave, numpy as np, sherpa_onnx
+
+model_dir = os.environ['XYZ_MODEL_DIR_ESC']
+tmpdir    = os.environ['TMPDIR_ESC']
+
+recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+    model=f"{model_dir}/model.int8.onnx",
+    tokens=f"{model_dir}/tokens.txt",
+    use_itn=True, debug=False, num_threads=4,
+)
+
+SAMPLE_RATE = 16000
+CHUNK_SECS  = 30
+
+results = []
+with wave.open(f"{tmpdir}/audio.wav") as wf:
+    offset = 0.0
+    while True:
+        frames = wf.readframes(CHUNK_SECS * SAMPLE_RATE)
+        if not frames:
+            break
+        samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768
+        stream = recognizer.create_stream()
+        stream.accept_waveform(SAMPLE_RATE, samples)
+        recognizer.decode_stream(stream)
+        text = stream.result.text.strip()
+        if text:
+            results.append((offset, text))
+        offset += CHUNK_SECS
+
+def fmt(s):
+    s = int(s); return f"[{s//60:02d}:{s%60:02d}]"
+
+open(f"{tmpdir}/cleaned.txt", "w").write("\n\n".join(t for _, t in results) + "\n")
+open(f"{tmpdir}/timestamped.txt", "w").write("  \n".join(f"{fmt(ts)} {t}" for ts, t in results) + "\n")
+print(f"Transcribed {len(results)} segments.")
+PYEOF
+    [ -s "$TMPDIR/cleaned.txt" ] && XYZ_TRANSCRIBED=true
+  fi
+
+  # Fallback: Whisper (produces SRT → Step 3 parses it normally)
+  if [ "$XYZ_TRANSCRIBED" = false ]; then
+    if command -v whisper &>/dev/null; then
+      echo "Transcribing with whisper CLI (turbo)..."
+      whisper "$TMPDIR/audio.wav" --model turbo --language zh \
+        --output_format srt --output_dir "$TMPDIR" 2>/dev/null
+      SUB_FILE=$(find "$TMPDIR" -name "*.srt" | head -1)
+      [ -n "$SUB_FILE" ] && XYZ_TRANSCRIBED=true
+    elif python3 -c "import faster_whisper" 2>/dev/null; then
+      echo "Transcribing with faster-whisper..."
+      TMPDIR_ESC="$TMPDIR" python3 <<'PYEOF'
+import os
+from faster_whisper import WhisperModel
+tmpdir = os.environ['TMPDIR_ESC']
+model = WhisperModel("large-v2", device="cpu", compute_type="int8")
+segs, _ = model.transcribe(f"{tmpdir}/audio.wav", language="zh")
+def st(s):
+    h,r=divmod(int(s),3600); m,s2=divmod(r,60); ms=round((s-int(s))*1000)
+    return f"{h:02d}:{m:02d}:{s2:02d},{ms:03d}"
+with open(f"{tmpdir}/audio.srt","w") as f:
+    for i,seg in enumerate(segs,1):
+        f.write(f"{i}\n{st(seg.start)} --> {st(seg.end)}\n{seg.text.strip()}\n\n")
+PYEOF
+      SUB_FILE=$(find "$TMPDIR" -name "*.srt" | head -1)
+      [ -n "$SUB_FILE" ] && XYZ_TRANSCRIBED=true
+    elif python3 -c "import whisper" 2>/dev/null; then
+      echo "Transcribing with openai-whisper Python API..."
+      TMPDIR_ESC="$TMPDIR" python3 <<'PYEOF'
+import os, whisper
+tmpdir = os.environ['TMPDIR_ESC']
+model = whisper.load_model("turbo")
+result = model.transcribe(f"{tmpdir}/audio.wav", language="zh")
+def st(s):
+    h,r=divmod(int(s),3600); m,s2=divmod(r,60); ms=round((s-int(s))*1000)
+    return f"{h:02d}:{m:02d}:{s2:02d},{ms:03d}"
+with open(f"{tmpdir}/audio.srt","w") as f:
+    for i,seg in enumerate(result["segments"],1):
+        f.write(f"{i}\n{st(seg['start'])} --> {st(seg['end'])}\n{seg['text'].strip()}\n\n")
+PYEOF
+      SUB_FILE=$(find "$TMPDIR" -name "*.srt" | head -1)
+      [ -n "$SUB_FILE" ] && XYZ_TRANSCRIBED=true
+    fi
+  fi
+
+  if [ "$XYZ_TRANSCRIBED" = false ]; then
+    echo "No ASR backend available. Install one:"
+    echo "  pip install sherpa-onnx   # recommended — reuses existing Type4Me model, no download"
+    echo "  pip install openai-whisper"
+    echo "  pip install faster-whisper"
+    rm -rf "$TMPDIR"; exit 1
+  fi
+
+  SUBTITLE_LANG="zh"
+fi
+```
+
+### Fail if no subtitles
+
+For xiaoyuzhou using sherpa-onnx, `SUB_FILE` is empty because `cleaned.txt`/`timestamped.txt` were written directly — that is expected. Only fail here for other platforms.
+
+```bash
+if [ -z "$SUB_FILE" ] && [ "$PLATFORM" != "xiaoyuzhou" ]; then
   echo "No subtitles found for this video."
   echo "  - No manually uploaded subtitles"
   echo "  - No auto-generated subtitles"
@@ -157,7 +321,10 @@ Produce two outputs from the same subtitle file:
 - `cleaned.txt` — no timestamps, for LLM summary input (Steps 7–9)
 - `timestamped.txt` — `[mm:ss] text` format, for saving to vault and chapter inference
 
+Skip this step if `$PLATFORM = "xiaoyuzhou"` and `cleaned.txt` already exists (written directly by the sherpa-onnx transcription in Step 2). Only run when `$SUB_FILE` is set.
+
 ```bash
+if [ -n "$SUB_FILE" ]; then
 EXT="${SUB_FILE##*.}"
 
 python3 - "$SUB_FILE" "$EXT" "$TMPDIR" <<'EOF'
@@ -224,6 +391,7 @@ else:  # vtt
 open(f"{tmpdir}/cleaned.txt", 'w').write('\n\n'.join(cleaned_out) + '\n')
 open(f"{tmpdir}/timestamped.txt", 'w').write('  \n'.join(ts_out) + '\n')
 EOF
+fi  # end if [ -n "$SUB_FILE" ]
 ```
 
 ---
@@ -250,11 +418,26 @@ print(title[:100])
 
 ## Step 5 — Fetch video metadata
 
-Use `$COOKIE_ARGS` (set in Step 2; empty string for YouTube, `--cookies FILE` for Bilibili):
+For xiaoyuzhou, read `$TMPDIR/xyz_meta.json` written in Step 2 — no yt-dlp needed. For all other platforms, use `$COOKIE_ARGS` (set in Step 2; empty for YouTube/TED, `--cookies FILE` for Bilibili):
 
 ```bash
-yt-dlp --dump-json --no-playlist $COOKIE_ARGS "$URL" 2>/dev/null \
-  | python3 -c "
+if [ "$PLATFORM" = "xiaoyuzhou" ]; then
+  python3 -c "
+import json, sys
+d = json.load(open('$TMPDIR/xyz_meta.json'))
+secs = d.get('duration_secs', 0)
+duration_str = f\"{secs // 60}:{secs % 60:02d}\"
+print('TITLE:', d.get('title',''))
+print('CHANNEL:', d.get('podcast_name',''))
+print('DURATION:', duration_str)
+print('DATE:', d.get('pub_date',''))
+print('DESCRIPTION:', d.get('description',''))
+print('CATEGORY:', 'Podcast')
+print('CHAPTERS:')
+"
+else
+  yt-dlp --dump-json --no-playlist $COOKIE_ARGS "$URL" 2>/dev/null \
+    | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 desc = d.get('description','')
@@ -271,6 +454,7 @@ print('CATEGORY:', cats[0] if cats else '')
 print('CHAPTERS:')
 print(chapter_lines)
 "
+fi
 ```
 
 ---
@@ -512,3 +696,9 @@ Summary: $OUTPUT_DIR/$SLUG-summary.md
 | `yt-dlp --dump-json` fails (metadata step) | Continue without metadata. Use empty strings for title, channel, description; skip chapters. Note to user that metadata was unavailable. |
 | Output directory does not exist | `mkdir -p` creates it automatically. No user action needed. |
 | Transcript > 120k chars, map-reduce produces empty notes | Stop. Tell user the transcript may be in an unsupported format or language. Show the first 200 chars of `cleaned.txt` for diagnosis. |
+| xiaoyuzhou `__NEXT_DATA__` not found | Stop. Page structure may have changed. Tell user to report the episode URL. |
+| xiaoyuzhou audio download fails (empty file) | Stop. Check if the URL still resolves: `curl -I <audio_url>`. May be geo-restricted or expired. |
+| `ffmpeg` not found (xiaoyuzhou m4a → wav) | Stop. Tell user to install: `brew install ffmpeg`. |
+| `sherpa_onnx` import fails | Automatic fallback to Whisper. If both fail, tell user to run `pip install sherpa-onnx` (no model download — reuses Type4Me model). |
+| Type4Me SenseVoice model directory not found | Automatic fallback to Whisper. If no Whisper either, tell user to run `pip install sherpa-onnx` and check that Type4Me is installed. |
+| sherpa-onnx transcription produces empty `cleaned.txt` | Stop. Audio may be silent or in unsupported format. Show `wc -c $TMPDIR/audio.wav` for diagnosis. |
